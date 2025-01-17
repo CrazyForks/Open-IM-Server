@@ -16,19 +16,29 @@ package msggateway
 
 import (
 	"context"
-
-	"github.com/OpenIMSDK/protocol/push"
-	"github.com/OpenIMSDK/tools/discoveryregistry"
+	"encoding/json"
+	"github.com/openimsdk/open-im-server/v3/pkg/rpcli"
+	"sync"
 
 	"github.com/go-playground/validator/v10"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/OpenIMSDK/protocol/msg"
-	"github.com/OpenIMSDK/protocol/sdkws"
-	"github.com/OpenIMSDK/tools/utils"
-
-	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
+	"github.com/openimsdk/protocol/msg"
+	"github.com/openimsdk/protocol/push"
+	"github.com/openimsdk/protocol/sdkws"
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/utils/jsonutil"
 )
+
+const (
+	TextPing = "ping"
+	TextPong = "pong"
+)
+
+type TextMessage struct {
+	Type string          `json:"type"`
+	Body json.RawMessage `json:"body"`
+}
 
 type Req struct {
 	ReqIdentifier int32  `json:"reqIdentifier" validate:"required"`
@@ -46,7 +56,28 @@ func (r *Req) String() string {
 	tReq.SendID = r.SendID
 	tReq.OperationID = r.OperationID
 	tReq.MsgIncr = r.MsgIncr
-	return utils.StructToJsonString(tReq)
+	return jsonutil.StructToJsonString(tReq)
+}
+
+var reqPool = sync.Pool{
+	New: func() any {
+		return new(Req)
+	},
+}
+
+func getReq() *Req {
+	req := reqPool.Get().(*Req)
+	req.Data = nil
+	req.MsgIncr = ""
+	req.OperationID = ""
+	req.ReqIdentifier = 0
+	req.SendID = ""
+	req.Token = ""
+	return req
+}
+
+func freeReq(req *Req) {
+	reqPool.Put(req)
 }
 
 type Resp struct {
@@ -65,149 +96,186 @@ func (r *Resp) String() string {
 	tResp.OperationID = r.OperationID
 	tResp.ErrCode = r.ErrCode
 	tResp.ErrMsg = r.ErrMsg
-	return utils.StructToJsonString(tResp)
+	return jsonutil.StructToJsonString(tResp)
 }
 
 type MessageHandler interface {
-	GetSeq(context context.Context, data Req) ([]byte, error)
-	SendMessage(context context.Context, data Req) ([]byte, error)
-	SendSignalMessage(context context.Context, data Req) ([]byte, error)
-	PullMessageBySeqList(context context.Context, data Req) ([]byte, error)
-	UserLogout(context context.Context, data Req) ([]byte, error)
-	SetUserDeviceBackground(context context.Context, data Req) ([]byte, bool, error)
+	GetSeq(ctx context.Context, data *Req) ([]byte, error)
+	SendMessage(ctx context.Context, data *Req) ([]byte, error)
+	SendSignalMessage(ctx context.Context, data *Req) ([]byte, error)
+	PullMessageBySeqList(ctx context.Context, data *Req) ([]byte, error)
+	GetConversationsHasReadAndMaxSeq(ctx context.Context, data *Req) ([]byte, error)
+	GetSeqMessage(ctx context.Context, data *Req) ([]byte, error)
+	UserLogout(ctx context.Context, data *Req) ([]byte, error)
+	SetUserDeviceBackground(ctx context.Context, data *Req) ([]byte, bool, error)
+	GetLastMessage(ctx context.Context, data *Req) ([]byte, error)
 }
 
 var _ MessageHandler = (*GrpcHandler)(nil)
 
 type GrpcHandler struct {
-	msgRpcClient *rpcclient.MessageRpcClient
-	pushClient   *rpcclient.PushRpcClient
-	validate     *validator.Validate
+	validate   *validator.Validate
+	msgClient  *rpcli.MsgClient
+	pushClient *rpcli.PushMsgServiceClient
 }
 
-func NewGrpcHandler(validate *validator.Validate, client discoveryregistry.SvcDiscoveryRegistry) *GrpcHandler {
-	msgRpcClient := rpcclient.NewMessageRpcClient(client)
-	pushRpcClient := rpcclient.NewPushRpcClient(client)
+func NewGrpcHandler(validate *validator.Validate, msgClient *rpcli.MsgClient, pushClient *rpcli.PushMsgServiceClient) *GrpcHandler {
 	return &GrpcHandler{
-		msgRpcClient: &msgRpcClient,
-		pushClient:   &pushRpcClient, validate: validate,
+		validate:   validate,
+		msgClient:  msgClient,
+		pushClient: pushClient,
 	}
 }
 
-func (g GrpcHandler) GetSeq(context context.Context, data Req) ([]byte, error) {
+func (g *GrpcHandler) GetSeq(ctx context.Context, data *Req) ([]byte, error) {
 	req := sdkws.GetMaxSeqReq{}
 	if err := proto.Unmarshal(data.Data, &req); err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "GetSeq: error unmarshaling request", "action", "unmarshal", "dataType", "GetMaxSeqReq")
 	}
 	if err := g.validate.Struct(&req); err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "GetSeq: validation failed", "action", "validate", "dataType", "GetMaxSeqReq")
 	}
-	resp, err := g.msgRpcClient.GetMaxSeq(context, &req)
+	resp, err := g.msgClient.MsgClient.GetMaxSeq(ctx, &req)
 	if err != nil {
 		return nil, err
 	}
 	c, err := proto.Marshal(resp)
 	if err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "GetSeq: error marshaling response", "action", "marshal", "dataType", "GetMaxSeqResp")
 	}
 	return c, nil
 }
 
-func (g GrpcHandler) SendMessage(context context.Context, data Req) ([]byte, error) {
-	msgData := sdkws.MsgData{}
+// SendMessage handles the sending of messages through gRPC. It unmarshals the request data,
+// validates the message, and then sends it using the message RPC client.
+func (g *GrpcHandler) SendMessage(ctx context.Context, data *Req) ([]byte, error) {
+	var msgData sdkws.MsgData
 	if err := proto.Unmarshal(data.Data, &msgData); err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "SendMessage: error unmarshaling message data", "action", "unmarshal", "dataType", "MsgData")
 	}
+
 	if err := g.validate.Struct(&msgData); err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "SendMessage: message data validation failed", "action", "validate", "dataType", "MsgData")
 	}
+
 	req := msg.SendMsgReq{MsgData: &msgData}
-	resp, err := g.msgRpcClient.SendMsg(context, &req)
+	resp, err := g.msgClient.MsgClient.SendMsg(ctx, &req)
+	if err != nil {
+		return nil, err
+	}
+
+	c, err := proto.Marshal(resp)
+	if err != nil {
+		return nil, errs.WrapMsg(err, "SendMessage: error marshaling response", "action", "marshal", "dataType", "SendMsgResp")
+	}
+
+	return c, nil
+}
+
+func (g *GrpcHandler) SendSignalMessage(ctx context.Context, data *Req) ([]byte, error) {
+	resp, err := g.msgClient.MsgClient.SendMsg(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	c, err := proto.Marshal(resp)
 	if err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "error marshaling response", "action", "marshal", "dataType", "SendMsgResp")
 	}
 	return c, nil
 }
 
-func (g GrpcHandler) SendSignalMessage(context context.Context, data Req) ([]byte, error) {
-	resp, err := g.msgRpcClient.SendMsg(context, nil)
-	if err != nil {
-		return nil, err
-	}
-	c, err := proto.Marshal(resp)
-	if err != nil {
-		return nil, err
-	}
-	return c, nil
-}
-
-func (g GrpcHandler) PullMessageBySeqList(context context.Context, data Req) ([]byte, error) {
+func (g *GrpcHandler) PullMessageBySeqList(ctx context.Context, data *Req) ([]byte, error) {
 	req := sdkws.PullMessageBySeqsReq{}
 	if err := proto.Unmarshal(data.Data, &req); err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "err proto unmarshal", "action", "unmarshal", "dataType", "PullMessageBySeqsReq")
 	}
 	if err := g.validate.Struct(data); err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "validation failed", "action", "validate", "dataType", "PullMessageBySeqsReq")
 	}
-	resp, err := g.msgRpcClient.PullMessageBySeqList(context, &req)
+	resp, err := g.msgClient.MsgClient.PullMessageBySeqs(ctx, &req)
 	if err != nil {
 		return nil, err
 	}
 	c, err := proto.Marshal(resp)
 	if err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "error marshaling response", "action", "marshal", "dataType", "PullMessageBySeqsResp")
 	}
 	return c, nil
 }
 
-func (g GrpcHandler) UserLogout(context context.Context, data Req) ([]byte, error) {
+func (g *GrpcHandler) GetConversationsHasReadAndMaxSeq(ctx context.Context, data *Req) ([]byte, error) {
+	req := msg.GetConversationsHasReadAndMaxSeqReq{}
+	if err := proto.Unmarshal(data.Data, &req); err != nil {
+		return nil, errs.WrapMsg(err, "err proto unmarshal", "action", "unmarshal", "dataType", "GetConversationsHasReadAndMaxSeq")
+	}
+	if err := g.validate.Struct(data); err != nil {
+		return nil, errs.WrapMsg(err, "validation failed", "action", "validate", "dataType", "GetConversationsHasReadAndMaxSeq")
+	}
+	resp, err := g.msgClient.MsgClient.GetConversationsHasReadAndMaxSeq(ctx, &req)
+	if err != nil {
+		return nil, err
+	}
+	c, err := proto.Marshal(resp)
+	if err != nil {
+		return nil, errs.WrapMsg(err, "error marshaling response", "action", "marshal", "dataType", "GetConversationsHasReadAndMaxSeq")
+	}
+	return c, nil
+}
+
+func (g *GrpcHandler) GetSeqMessage(ctx context.Context, data *Req) ([]byte, error) {
+	req := msg.GetSeqMessageReq{}
+	if err := proto.Unmarshal(data.Data, &req); err != nil {
+		return nil, errs.WrapMsg(err, "error unmarshaling request", "action", "unmarshal", "dataType", "GetSeqMessage")
+	}
+	if err := g.validate.Struct(data); err != nil {
+		return nil, errs.WrapMsg(err, "validation failed", "action", "validate", "dataType", "GetSeqMessage")
+	}
+	resp, err := g.msgClient.MsgClient.GetSeqMessage(ctx, &req)
+	if err != nil {
+		return nil, err
+	}
+	c, err := proto.Marshal(resp)
+	if err != nil {
+		return nil, errs.WrapMsg(err, "error marshaling response", "action", "marshal", "dataType", "GetSeqMessage")
+	}
+	return c, nil
+}
+
+func (g *GrpcHandler) UserLogout(ctx context.Context, data *Req) ([]byte, error) {
 	req := push.DelUserPushTokenReq{}
 	if err := proto.Unmarshal(data.Data, &req); err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "error unmarshaling request", "action", "unmarshal", "dataType", "DelUserPushTokenReq")
 	}
-	resp, err := g.pushClient.DelUserPushToken(context, &req)
+	resp, err := g.pushClient.PushMsgServiceClient.DelUserPushToken(ctx, &req)
 	if err != nil {
 		return nil, err
 	}
 	c, err := proto.Marshal(resp)
 	if err != nil {
-		return nil, err
+		return nil, errs.WrapMsg(err, "error marshaling response", "action", "marshal", "dataType", "DelUserPushTokenResp")
 	}
 	return c, nil
 }
 
-func (g GrpcHandler) SetUserDeviceBackground(_ context.Context, data Req) ([]byte, bool, error) {
+func (g *GrpcHandler) SetUserDeviceBackground(ctx context.Context, data *Req) ([]byte, bool, error) {
 	req := sdkws.SetAppBackgroundStatusReq{}
 	if err := proto.Unmarshal(data.Data, &req); err != nil {
-		return nil, false, err
+		return nil, false, errs.WrapMsg(err, "error unmarshaling request", "action", "unmarshal", "dataType", "SetAppBackgroundStatusReq")
 	}
 	if err := g.validate.Struct(data); err != nil {
-		return nil, false, err
+		return nil, false, errs.WrapMsg(err, "validation failed", "action", "validate", "dataType", "SetAppBackgroundStatusReq")
 	}
 	return nil, req.IsBackground, nil
 }
 
-// func (g GrpcHandler) call[T any](ctx context.Context, data Req, m proto.Message, rpc func(ctx context.Context, req
-// proto.Message)) ([]byte, error) {
-//	if err := proto.Unmarshal(data.Data, m); err != nil {
-//		return nil, err
-//	}
-//	if err := g.validate.Struct(m); err != nil {
-//		return nil, err
-//	}
-//	rpc(ctx, m)
-//	req := msg.SendMsgReq{MsgData: &msgData}
-//	resp, err := g.notification.Msg.SendMsg(context, &req)
-//	if err != nil {
-//		return nil, err
-//	}
-//	c, err := proto.Marshal(resp)
-//	if err != nil {
-//		return nil, err
-//	}
-//	return c, nil
-//}
+func (g *GrpcHandler) GetLastMessage(ctx context.Context, data *Req) ([]byte, error) {
+	var req msg.GetLastMessageReq
+	if err := proto.Unmarshal(data.Data, &req); err != nil {
+		return nil, err
+	}
+	resp, err := g.msgClient.GetLastMessage(ctx, &req)
+	if err != nil {
+		return nil, err
+	}
+	return proto.Marshal(resp)
+}

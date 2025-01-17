@@ -14,18 +14,63 @@
 
 package cmd
 
-import "github.com/spf13/cobra"
+import (
+	"context"
+
+	"github.com/openimsdk/open-im-server/v3/internal/api"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
+	"github.com/openimsdk/open-im-server/v3/version"
+	"github.com/openimsdk/tools/system/program"
+	"github.com/spf13/cobra"
+)
 
 type ApiCmd struct {
 	*RootCmd
+	ctx       context.Context
+	configMap map[string]any
+	apiConfig *api.Config
 }
 
 func NewApiCmd() *ApiCmd {
-	return &ApiCmd{NewRootCmd("api")}
+	apiConfig := api.Config{AllConfig: &config.AllConfig{}}
+	ret := &ApiCmd{apiConfig: &apiConfig}
+	ret.configMap = map[string]any{
+		config.DiscoveryConfigFilename:          &apiConfig.Discovery,
+		config.KafkaConfigFileName:              &apiConfig.Kafka,
+		config.LocalCacheConfigFileName:         &apiConfig.LocalCache,
+		config.LogConfigFileName:                &apiConfig.Log,
+		config.MinioConfigFileName:              &apiConfig.Minio,
+		config.MongodbConfigFileName:            &apiConfig.Mongo,
+		config.NotificationFileName:             &apiConfig.Notification,
+		config.OpenIMAPICfgFileName:             &apiConfig.API,
+		config.OpenIMCronTaskCfgFileName:        &apiConfig.CronTask,
+		config.OpenIMMsgGatewayCfgFileName:      &apiConfig.MsgGateway,
+		config.OpenIMMsgTransferCfgFileName:     &apiConfig.MsgTransfer,
+		config.OpenIMPushCfgFileName:            &apiConfig.Push,
+		config.OpenIMRPCAuthCfgFileName:         &apiConfig.Auth,
+		config.OpenIMRPCConversationCfgFileName: &apiConfig.Conversation,
+		config.OpenIMRPCFriendCfgFileName:       &apiConfig.Friend,
+		config.OpenIMRPCGroupCfgFileName:        &apiConfig.Group,
+		config.OpenIMRPCMsgCfgFileName:          &apiConfig.Msg,
+		config.OpenIMRPCThirdCfgFileName:        &apiConfig.Third,
+		config.OpenIMRPCUserCfgFileName:         &apiConfig.User,
+		config.RedisConfigFileName:              &apiConfig.Redis,
+		config.ShareFileName:                    &apiConfig.Share,
+		config.WebhooksConfigFileName:           &apiConfig.Webhooks,
+	}
+	ret.RootCmd = NewRootCmd(program.GetProcessName(), WithConfigMap(ret.configMap))
+	ret.ctx = context.WithValue(context.Background(), "version", version.Version)
+	ret.Command.RunE = func(cmd *cobra.Command, args []string) error {
+		apiConfig.ConfigPath = ret.configPath
+		return ret.runE()
+	}
+	return ret
 }
 
-func (a *ApiCmd) AddApi(f func(port int) error) {
-	a.Command.RunE = func(cmd *cobra.Command, args []string) error {
-		return f(a.getPortFlag(cmd))
-	}
+func (a *ApiCmd) Exec() error {
+	return a.Execute()
+}
+
+func (a *ApiCmd) runE() error {
+	return api.Start(a.ctx, a.Index(), a.apiConfig)
 }

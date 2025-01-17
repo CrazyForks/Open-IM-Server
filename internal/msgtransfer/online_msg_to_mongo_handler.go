@@ -18,39 +18,34 @@ import (
 	"context"
 
 	"github.com/IBM/sarama"
-	"google.golang.org/protobuf/proto"
-
-	pbmsg "github.com/OpenIMSDK/protocol/msg"
-	"github.com/OpenIMSDK/tools/log"
-
 	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/controller"
-	kfk "github.com/openimsdk/open-im-server/v3/pkg/common/kafka"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/prommetrics"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/controller"
+	pbmsg "github.com/openimsdk/protocol/msg"
+	"github.com/openimsdk/tools/log"
+	"github.com/openimsdk/tools/mq/kafka"
+	"google.golang.org/protobuf/proto"
 )
 
 type OnlineHistoryMongoConsumerHandler struct {
-	historyConsumerGroup *kfk.MConsumerGroup
-	msgDatabase          controller.CommonMsgDatabase
+	historyConsumerGroup *kafka.MConsumerGroup
+	msgTransferDatabase  controller.MsgTransferDatabase
 }
 
-func NewOnlineHistoryMongoConsumerHandler(database controller.CommonMsgDatabase) *OnlineHistoryMongoConsumerHandler {
-	mc := &OnlineHistoryMongoConsumerHandler{
-		historyConsumerGroup: kfk.NewMConsumerGroup(&kfk.MConsumerGroupConfig{
-			KafkaVersion:   sarama.V2_0_0_0,
-			OffsetsInitial: sarama.OffsetNewest, IsReturnErr: false,
-		}, []string{config.Config.Kafka.MsgToMongo.Topic},
-			config.Config.Kafka.Addr, config.Config.Kafka.ConsumerGroupID.MsgToMongo),
-		msgDatabase: database,
+func NewOnlineHistoryMongoConsumerHandler(kafkaConf *config.Kafka, database controller.MsgTransferDatabase) (*OnlineHistoryMongoConsumerHandler, error) {
+	historyConsumerGroup, err := kafka.NewMConsumerGroup(kafkaConf.Build(), kafkaConf.ToMongoGroupID, []string{kafkaConf.ToMongoTopic}, true)
+	if err != nil {
+		return nil, err
 	}
-	return mc
+
+	mc := &OnlineHistoryMongoConsumerHandler{
+		historyConsumerGroup: historyConsumerGroup,
+		msgTransferDatabase:  database,
+	}
+	return mc, nil
 }
 
-func (mc *OnlineHistoryMongoConsumerHandler) handleChatWs2Mongo(
-	ctx context.Context,
-	cMsg *sarama.ConsumerMessage,
-	key string,
-	session sarama.ConsumerGroupSession,
-) {
+func (mc *OnlineHistoryMongoConsumerHandler) handleChatWs2Mongo(ctx context.Context, cMsg *sarama.ConsumerMessage, key string, session sarama.ConsumerGroupSession) {
 	msg := cMsg.Value
 	msgFromMQ := pbmsg.MsgDataToMongoByMQ{}
 	err := proto.Unmarshal(msg, &msgFromMQ)
@@ -62,8 +57,8 @@ func (mc *OnlineHistoryMongoConsumerHandler) handleChatWs2Mongo(
 		log.ZError(ctx, "msgFromMQ.MsgData is empty", nil, "cMsg", cMsg)
 		return
 	}
-	log.ZInfo(ctx, "mongo consumer recv msg", "msgs", msgFromMQ.MsgData)
-	err = mc.msgDatabase.BatchInsertChat2DB(ctx, msgFromMQ.ConversationID, msgFromMQ.MsgData, msgFromMQ.LastSeq)
+	log.ZDebug(ctx, "mongo consumer recv msg", "msgs", msgFromMQ.String())
+	err = mc.msgTransferDatabase.BatchInsertChat2DB(ctx, msgFromMQ.ConversationID, msgFromMQ.MsgData, msgFromMQ.LastSeq)
 	if err != nil {
 		log.ZError(
 			ctx,
@@ -74,33 +69,21 @@ func (mc *OnlineHistoryMongoConsumerHandler) handleChatWs2Mongo(
 			"conversationID",
 			msgFromMQ.ConversationID,
 		)
+		prommetrics.MsgInsertMongoFailedCounter.Inc()
+	} else {
+		prommetrics.MsgInsertMongoSuccessCounter.Inc()
 	}
 	var seqs []int64
 	for _, msg := range msgFromMQ.MsgData {
 		seqs = append(seqs, msg.Seq)
 	}
-	err = mc.msgDatabase.DeleteMessagesFromCache(ctx, msgFromMQ.ConversationID, seqs)
-	if err != nil {
-		log.ZError(
-			ctx,
-			"remove cache msg from redis err",
-			err,
-			"msg",
-			msgFromMQ.MsgData,
-			"conversationID",
-			msgFromMQ.ConversationID,
-		)
-	}
-	mc.msgDatabase.DelUserDeleteMsgsList(ctx, msgFromMQ.ConversationID, seqs)
 }
 
-func (OnlineHistoryMongoConsumerHandler) Setup(_ sarama.ConsumerGroupSession) error   { return nil }
-func (OnlineHistoryMongoConsumerHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
+func (*OnlineHistoryMongoConsumerHandler) Setup(_ sarama.ConsumerGroupSession) error { return nil }
 
-func (mc *OnlineHistoryMongoConsumerHandler) ConsumeClaim(
-	sess sarama.ConsumerGroupSession,
-	claim sarama.ConsumerGroupClaim,
-) error { // a instance in the consumer group
+func (*OnlineHistoryMongoConsumerHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
+
+func (mc *OnlineHistoryMongoConsumerHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error { // an instance in the consumer group
 	log.ZDebug(context.Background(), "online new session msg come", "highWaterMarkOffset",
 		claim.HighWaterMarkOffset(), "topic", claim.Topic(), "partition", claim.Partition())
 	for msg := range claim.Messages() {
