@@ -23,24 +23,20 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
-	"github.com/OpenIMSDK/tools/errs"
-	"github.com/OpenIMSDK/tools/log"
-	"github.com/OpenIMSDK/tools/mcontext"
-	"github.com/OpenIMSDK/tools/utils/splitter"
-
-	"github.com/openimsdk/open-im-server/v3/internal/push/offlinepush"
+	"github.com/openimsdk/open-im-server/v3/internal/push/offlinepush/options"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/cache"
-	http2 "github.com/openimsdk/open-im-server/v3/pkg/common/http"
-
-	"github.com/OpenIMSDK/tools/utils"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/cache"
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/log"
+	"github.com/openimsdk/tools/mcontext"
+	"github.com/openimsdk/tools/utils/httputil"
+	"github.com/openimsdk/tools/utils/splitter"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
-	ErrTokenExpire = errors.New("token expire")
-	ErrUserIDEmpty = errors.New("userIDs is empty")
+	ErrTokenExpire = errs.New("token expire")
+	ErrUserIDEmpty = errs.New("userIDs is empty")
 )
 
 const (
@@ -49,27 +45,34 @@ const (
 	taskURL      = "/push/list/message"
 	batchPushURL = "/push/list/alias"
 
-	// codes.
+	// Codes.
 	tokenExpireCode = 10001
 	tokenExpireTime = 60 * 60 * 23
 	taskIDTTL       = 1000 * 60 * 60 * 24
 )
 
 type Client struct {
-	cache           cache.MsgModel
+	cache           cache.ThirdCache
 	tokenExpireTime int64
 	taskIDTTL       int64
+	pushConf        *config.Push
+	httpClient      *httputil.HTTPClient
 }
 
-func NewClient(cache cache.MsgModel) *Client {
-	return &Client{cache: cache, tokenExpireTime: tokenExpireTime, taskIDTTL: taskIDTTL}
+func NewClient(pushConf *config.Push, cache cache.ThirdCache) *Client {
+	return &Client{cache: cache,
+		tokenExpireTime: tokenExpireTime,
+		taskIDTTL:       taskIDTTL,
+		pushConf:        pushConf,
+		httpClient:      httputil.NewHTTPClient(httputil.NewClientConfig()),
+	}
 }
 
-func (g *Client) Push(ctx context.Context, userIDs []string, title, content string, opts *offlinepush.Opts) error {
+func (g *Client) Push(ctx context.Context, userIDs []string, title, content string, opts *options.Opts) error {
 	token, err := g.cache.GetGetuiToken(ctx)
 	if err != nil {
-		if errs.Unwrap(err) == redis.Nil {
-			log.ZInfo(ctx, "getui token not exist in redis")
+		if errors.Is(err, redis.Nil) {
+			log.ZDebug(ctx, "getui token not exist in redis")
 			token, err = g.getTokenAndSave2Redis(ctx)
 			if err != nil {
 				return err
@@ -78,7 +81,7 @@ func (g *Client) Push(ctx context.Context, userIDs []string, title, content stri
 			return err
 		}
 	}
-	pushReq := newPushReq(title, content)
+	pushReq := newPushReq(g.pushConf, title, content)
 	pushReq.setPushChannel(title, content)
 	if len(userIDs) > 1 {
 		maxNum := 999
@@ -89,9 +92,17 @@ func (g *Client) Push(ctx context.Context, userIDs []string, title, content stri
 			for i, v := range s.GetSplitResult() {
 				go func(index int, userIDs []string) {
 					defer wg.Done()
-					if err2 := g.batchPush(ctx, token, userIDs, pushReq); err2 != nil {
-						log.ZError(ctx, "batchPush failed", err2, "index", index, "token", token, "req", pushReq)
-						err = err2
+					for i := 0; i < len(userIDs); i += maxNum {
+						end := i + maxNum
+						if end > len(userIDs) {
+							end = len(userIDs)
+						}
+						if err = g.batchPush(ctx, token, userIDs[i:end], pushReq); err != nil {
+							log.ZError(ctx, "batchPush failed", err, "index", index, "token", token, "req", pushReq)
+						}
+					}
+					if err = g.batchPush(ctx, token, userIDs, pushReq); err != nil {
+						log.ZError(ctx, "batchPush failed", err, "index", index, "token", token, "req", pushReq)
 					}
 				}(i, v.Item)
 			}
@@ -114,13 +125,13 @@ func (g *Client) Push(ctx context.Context, userIDs []string, title, content stri
 func (g *Client) Auth(ctx context.Context, timeStamp int64) (token string, expireTime int64, err error) {
 	h := sha256.New()
 	h.Write(
-		[]byte(config.Config.Push.GeTui.AppKey + strconv.Itoa(int(timeStamp)) + config.Config.Push.GeTui.MasterSecret),
+		[]byte(g.pushConf.GeTui.AppKey + strconv.Itoa(int(timeStamp)) + g.pushConf.GeTui.MasterSecret),
 	)
 	sign := hex.EncodeToString(h.Sum(nil))
 	reqAuth := AuthReq{
 		Sign:      sign,
 		Timestamp: strconv.Itoa(int(timeStamp)),
-		AppKey:    config.Config.Push.GeTui.AppKey,
+		AppKey:    g.pushConf.GeTui.AppKey,
 	}
 	respAuth := AuthResp{}
 	err = g.request(ctx, authURL, reqAuth, "", &respAuth)
@@ -134,10 +145,10 @@ func (g *Client) Auth(ctx context.Context, timeStamp int64) (token string, expir
 func (g *Client) GetTaskID(ctx context.Context, token string, pushReq PushReq) (string, error) {
 	respTask := TaskResp{}
 	ttl := int64(1000 * 60 * 5)
-	pushReq.Settings = &Settings{TTL: &ttl}
+	pushReq.Settings = &Settings{TTL: &ttl, Strategy: defaultStrategy}
 	err := g.request(ctx, taskURL, pushReq, token, &respTask)
 	if err != nil {
-		return "", utils.Wrap(err, "")
+		return "", errs.Wrap(err)
 	}
 	return respTask.TaskID, nil
 }
@@ -159,25 +170,26 @@ func (g *Client) singlePush(ctx context.Context, token, userID string, pushReq P
 	return g.request(ctx, pushURL, pushReq, token, nil)
 }
 
-func (g *Client) request(ctx context.Context, url string, input interface{}, token string, output interface{}) error {
+func (g *Client) request(ctx context.Context, url string, input any, token string, output any) error {
 	header := map[string]string{"token": token}
 	resp := &Resp{}
 	resp.Data = output
-	return g.postReturn(ctx, config.Config.Push.GeTui.PushUrl+url, header, input, resp, 3)
+	return g.postReturn(ctx, g.pushConf.GeTui.PushUrl+url, header, input, resp, 3)
 }
 
 func (g *Client) postReturn(
 	ctx context.Context,
 	url string,
 	header map[string]string,
-	input interface{},
+	input any,
 	output RespI,
 	timeout int,
 ) error {
-	err := http2.PostReturn(ctx, url, header, input, output, timeout)
+	err := g.httpClient.PostReturn(ctx, url, header, input, output, timeout)
 	if err != nil {
 		return err
 	}
+	log.ZDebug(ctx, "postReturn", "url", url, "header", header, "input", input, "timeout", timeout, "output", output)
 	return output.parseError()
 }
 
@@ -194,7 +206,7 @@ func (g *Client) getTokenAndSave2Redis(ctx context.Context) (token string, err e
 }
 
 func (g *Client) GetTaskIDAndSave2Redis(ctx context.Context, token string, pushReq PushReq) (taskID string, err error) {
-	pushReq.Settings = &Settings{TTL: &g.taskIDTTL}
+	pushReq.Settings = &Settings{TTL: &g.taskIDTTL, Strategy: defaultStrategy}
 	taskID, err = g.GetTaskID(ctx, token, pushReq)
 	if err != nil {
 		return

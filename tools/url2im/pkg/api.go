@@ -1,17 +1,30 @@
+// Copyright © 2023 OpenIM. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package pkg
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 
-	"github.com/OpenIMSDK/protocol/auth"
-	"github.com/OpenIMSDK/protocol/constant"
-	"github.com/OpenIMSDK/protocol/third"
+	"github.com/openimsdk/protocol/auth"
+	"github.com/openimsdk/protocol/third"
+	"github.com/openimsdk/tools/errs"
 )
 
 type Api struct {
@@ -25,7 +38,7 @@ type Api struct {
 func (a *Api) apiPost(ctx context.Context, path string, req any, resp any) error {
 	operationID, _ := ctx.Value("operationID").(string)
 	if operationID == "" {
-		return errors.New("call api operationID is empty")
+		return errs.New("call api operationID is empty")
 	}
 	reqBody, err := json.Marshal(req)
 	if err != nil {
@@ -74,14 +87,13 @@ func (a *Api) apiPost(ctx context.Context, path string, req any, resp any) error
 	return nil
 }
 
-func (a *Api) GetToken(ctx context.Context) (string, error) {
-	req := auth.UserTokenReq{
-		UserID:     a.UserID,
-		Secret:     a.Secret,
-		PlatformID: constant.AdminPlatformID,
+func (a *Api) GetAdminToken(ctx context.Context) (string, error) {
+	req := auth.GetAdminTokenReq{
+		UserID: a.UserID,
+		Secret: a.Secret,
 	}
-	var resp auth.UserTokenResp
-	if err := a.apiPost(ctx, "/auth/user_token", &req, &resp); err != nil {
+	var resp auth.GetAdminTokenResp
+	if err := a.apiPost(ctx, "/auth/get_admin_token", &req, &resp); err != nil {
 		return "", err
 	}
 	return resp.Token, nil

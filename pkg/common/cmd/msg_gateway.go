@@ -15,37 +15,61 @@
 package cmd
 
 import (
-	"github.com/openimsdk/open-im-server/v3/internal/msggateway"
-	//"github.com/openimsdk/open-im-server/internal/msggateway".
-	"github.com/spf13/cobra"
+	"context"
 
-	"github.com/OpenIMSDK/protocol/constant"
+	"github.com/openimsdk/open-im-server/v3/internal/msggateway"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/startrpc"
+	"github.com/openimsdk/open-im-server/v3/version"
+
+	"github.com/openimsdk/tools/system/program"
+	"github.com/spf13/cobra"
 )
 
 type MsgGatewayCmd struct {
 	*RootCmd
+	ctx              context.Context
+	configMap        map[string]any
+	msgGatewayConfig *msggateway.Config
 }
 
-func NewMsgGatewayCmd() MsgGatewayCmd {
-	return MsgGatewayCmd{NewRootCmd("msgGateway")}
-}
-
-func (m *MsgGatewayCmd) AddWsPortFlag() {
-	m.Command.Flags().IntP(constant.FlagWsPort, "w", 0, "ws server listen port")
-}
-
-func (m *MsgGatewayCmd) getWsPortFlag(cmd *cobra.Command) int {
-	port, _ := cmd.Flags().GetInt(constant.FlagWsPort)
-	return port
-}
-
-func (m *MsgGatewayCmd) addRunE() {
-	m.Command.RunE = func(cmd *cobra.Command, args []string) error {
-		return msggateway.RunWsAndServer(m.getPortFlag(cmd), m.getWsPortFlag(cmd), m.getPrometheusPortFlag(cmd))
+func NewMsgGatewayCmd() *MsgGatewayCmd {
+	var msgGatewayConfig msggateway.Config
+	ret := &MsgGatewayCmd{msgGatewayConfig: &msgGatewayConfig}
+	ret.configMap = map[string]any{
+		config.OpenIMMsgGatewayCfgFileName: &msgGatewayConfig.MsgGateway,
+		config.ShareFileName:               &msgGatewayConfig.Share,
+		config.RedisConfigFileName:         &msgGatewayConfig.RedisConfig,
+		config.WebhooksConfigFileName:      &msgGatewayConfig.WebhooksConfig,
+		config.DiscoveryConfigFilename:     &msgGatewayConfig.Discovery,
 	}
+	ret.RootCmd = NewRootCmd(program.GetProcessName(), WithConfigMap(ret.configMap))
+	ret.ctx = context.WithValue(context.Background(), "version", version.Version)
+	ret.Command.RunE = func(cmd *cobra.Command, args []string) error {
+		return ret.runE()
+	}
+	return ret
 }
 
 func (m *MsgGatewayCmd) Exec() error {
-	m.addRunE()
 	return m.Execute()
+}
+
+func (m *MsgGatewayCmd) runE() error {
+	m.msgGatewayConfig.Index = config.Index(m.Index())
+	rpc := m.msgGatewayConfig.MsgGateway.RPC
+	var prometheus config.Prometheus
+	return startrpc.Start(
+		m.ctx, &m.msgGatewayConfig.Discovery,
+		&prometheus,
+		rpc.ListenIP, rpc.RegisterIP,
+		rpc.AutoSetPorts,
+		rpc.Ports, int(m.msgGatewayConfig.Index),
+		m.msgGatewayConfig.Discovery.RpcService.MessageGateway,
+		nil,
+		m.msgGatewayConfig,
+		[]string{},
+		[]string{},
+		msggateway.Start,
+	)
 }

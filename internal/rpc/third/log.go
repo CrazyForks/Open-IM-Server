@@ -1,19 +1,31 @@
+// Copyright © 2023 OpenIM. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package third
 
 import (
 	"context"
 	"crypto/rand"
-	"fmt"
 	"time"
 
-	"github.com/OpenIMSDK/protocol/constant"
-	"github.com/OpenIMSDK/protocol/third"
-	"github.com/OpenIMSDK/tools/errs"
-	"github.com/OpenIMSDK/tools/utils"
-	utils2 "github.com/OpenIMSDK/tools/utils"
-
 	"github.com/openimsdk/open-im-server/v3/pkg/authverify"
-	relationtb "github.com/openimsdk/open-im-server/v3/pkg/common/db/table/relation"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/servererrs"
+	relationtb "github.com/openimsdk/open-im-server/v3/pkg/common/storage/model"
+	"github.com/openimsdk/protocol/constant"
+	"github.com/openimsdk/protocol/third"
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/utils/datautil"
 )
 
 func genLogID() string {
@@ -32,18 +44,19 @@ func genLogID() string {
 }
 
 func (t *thirdServer) UploadLogs(ctx context.Context, req *third.UploadLogsReq) (*third.UploadLogsResp, error) {
-	var DBlogs []*relationtb.Log
+	var dbLogs []*relationtb.Log
 	userID := ctx.Value(constant.OpUserID).(string)
 	platform := constant.PlatformID2Name[int(req.Platform)]
 	for _, fileURL := range req.FileURLs {
 		log := relationtb.Log{
-			Version:    req.Version,
-			SystemType: req.SystemType,
-			Platform:   platform,
-			UserID:     userID,
-			CreateTime: time.Now(),
-			Url:        fileURL.URL,
-			FileName:   fileURL.Filename,
+			Platform:     platform,
+			UserID:       userID,
+			CreateTime:   time.Now(),
+			Url:          fileURL.URL,
+			FileName:     fileURL.Filename,
+			AppFramework: req.AppFramework,
+			Version:      req.Version,
+			Ex:           req.Ex,
 		}
 		for i := 0; i < 20; i++ {
 			id := genLogID()
@@ -57,11 +70,11 @@ func (t *thirdServer) UploadLogs(ctx context.Context, req *third.UploadLogsReq) 
 			}
 		}
 		if log.LogID == "" {
-			return nil, errs.ErrData.Wrap("Log id gen error")
+			return nil, servererrs.ErrData.WrapMsg("Log id gen error")
 		}
-		DBlogs = append(DBlogs, &log)
+		dbLogs = append(dbLogs, &log)
 	}
-	err := t.thirdDatabase.UploadLogs(ctx, DBlogs)
+	err := t.thirdDatabase.UploadLogs(ctx, dbLogs)
 	if err != nil {
 		return nil, err
 	}
@@ -69,8 +82,7 @@ func (t *thirdServer) UploadLogs(ctx context.Context, req *third.UploadLogsReq) 
 }
 
 func (t *thirdServer) DeleteLogs(ctx context.Context, req *third.DeleteLogsReq) (*third.DeleteLogsResp, error) {
-
-	if err := authverify.CheckAdmin(ctx); err != nil {
+	if err := authverify.CheckAdmin(ctx, t.config.Share.IMAdminUserID); err != nil {
 		return nil, err
 	}
 	userID := ""
@@ -82,8 +94,8 @@ func (t *thirdServer) DeleteLogs(ctx context.Context, req *third.DeleteLogsReq) 
 	for _, log := range logs {
 		logIDs = append(logIDs, log.LogID)
 	}
-	if ids := utils2.Single(req.LogIDs, logIDs); len(ids) > 0 {
-		return nil, errs.ErrRecordNotFound.Wrap(fmt.Sprintf("logIDs not found%#v", ids))
+	if ids := datautil.Single(req.LogIDs, logIDs); len(ids) > 0 {
+		return nil, errs.ErrRecordNotFound.WrapMsg("logIDs not found", "logIDs", ids)
 	}
 	err = t.thirdDatabase.DeleteLogs(ctx, req.LogIDs, userID)
 	if err != nil {
@@ -98,7 +110,7 @@ func dbToPbLogInfos(logs []*relationtb.Log) []*third.LogInfo {
 		return &third.LogInfo{
 			Filename:   log.FileName,
 			UserID:     log.UserID,
-			Platform:   utils.StringToInt32(log.Platform),
+			Platform:   log.Platform,
 			Url:        log.Url,
 			CreateTime: log.CreateTime.UnixMilli(),
 			LogID:      log.LogID,
@@ -107,11 +119,11 @@ func dbToPbLogInfos(logs []*relationtb.Log) []*third.LogInfo {
 			Ex:         log.Ex,
 		}
 	}
-	return utils.Slice(logs, db2pbForLogInfo)
+	return datautil.Slice(logs, db2pbForLogInfo)
 }
 
 func (t *thirdServer) SearchLogs(ctx context.Context, req *third.SearchLogsReq) (*third.SearchLogsResp, error) {
-	if err := authverify.CheckAdmin(ctx); err != nil {
+	if err := authverify.CheckAdmin(ctx, t.config.Share.IMAdminUserID); err != nil {
 		return nil, err
 	}
 	var (
@@ -119,9 +131,16 @@ func (t *thirdServer) SearchLogs(ctx context.Context, req *third.SearchLogsReq) 
 		userIDs []string
 	)
 	if req.StartTime > req.EndTime {
-		return nil, errs.ErrArgs.Wrap("startTime>endTime")
+		return nil, errs.ErrArgs.WrapMsg("startTime>endTime")
 	}
-	total, logs, err := t.thirdDatabase.SearchLogs(ctx, req.Keyword, time.UnixMilli(req.StartTime), time.UnixMilli(req.EndTime), req.Pagination.PageNumber, req.Pagination.ShowNumber)
+	if req.StartTime == 0 && req.EndTime == 0 {
+		t := time.Date(2019, time.January, 1, 0, 0, 0, 0, time.UTC)
+		timestampMills := t.UnixNano() / int64(time.Millisecond)
+		req.StartTime = timestampMills
+		req.EndTime = time.Now().UnixNano() / int64(time.Millisecond)
+	}
+
+	total, logs, err := t.thirdDatabase.SearchLogs(ctx, req.Keyword, time.UnixMilli(req.StartTime), time.UnixMilli(req.EndTime), req.Pagination)
 	if err != nil {
 		return nil, err
 	}
@@ -129,18 +148,16 @@ func (t *thirdServer) SearchLogs(ctx context.Context, req *third.SearchLogsReq) 
 	for _, log := range logs {
 		userIDs = append(userIDs, log.UserID)
 	}
-	users, err := t.thirdDatabase.FindUsers(ctx, userIDs)
+	userMap, err := t.userClient.GetUsersInfoMap(ctx, userIDs)
 	if err != nil {
 		return nil, err
 	}
-	IDtoName := make(map[string]string)
-	for _, user := range users {
-		IDtoName[user.UserID] = user.Nickname
-	}
 	for _, pbLog := range pbLogs {
-		pbLog.Nickname = IDtoName[pbLog.UserID]
+		if user, ok := userMap[pbLog.UserID]; ok {
+			pbLog.Nickname = user.Nickname
+		}
 	}
 	resp.LogsInfos = pbLogs
-	resp.Total = total
+	resp.Total = uint32(total)
 	return &resp, nil
 }
